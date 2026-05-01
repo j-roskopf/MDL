@@ -216,3 +216,15 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+Music/
+csv/
+
+*.csv
+cookies.txt
+*.cookies.txt
+
+__pycache__/
+*.py[cod]
+.DS_Store
+
