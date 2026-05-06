@@ -147,6 +147,18 @@ that track is skipped on future runs.
 
 This means you can fix cookies, rerun a large batch, and it will continue without redownloading completed files.
 
+## MP3 Metadata
+
+New downloads are tagged with ID3 metadata before they are saved.
+
+The script writes every field it knows:
+
+```text
+Title, artist, album artist, album, year, track number, source URL, and embedded artwork
+```
+
+Spotify URL inputs usually provide the richest tags because the Spotify API includes release dates, track numbers, and album artwork. YouTube Music inputs use metadata and thumbnails reported by `yt-dlp`. CSV inputs always include title, artist, and album; if your CSV also has columns like `Release Date`, `Year`, `Track Number`, `Album Image URL`, or `Artwork URL`, those are used too.
+
 ## How Downloads Are Found
 
 Spotify CSV and Spotify URL inputs:

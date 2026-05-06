@@ -48,6 +48,9 @@ class TrackMetadata:
     album: str
     destination: Path
     source_url: str | None = None
+    year: str | None = None
+    track_number: int | None = None
+    artwork_url: str | None = None
 
 
 def clean_path_part(value: str, fallback: str) -> str:
@@ -88,6 +91,9 @@ def build_track_metadata(
     album: str,
     output_dir: Path,
     source_url: str | None = None,
+    year: str | None = None,
+    track_number: int | None = None,
+    artwork_url: str | None = None,
 ) -> TrackMetadata:
     """Build the final artist/album/track path from Spotify metadata."""
     track = track.strip()
@@ -105,16 +111,28 @@ def build_track_metadata(
         album=album,
         destination=destination,
         source_url=source_url,
+        year=year,
+        track_number=track_number,
+        artwork_url=artwork_url,
     )
 
 
 def track_from_csv_row(row: dict[str, str], output_dir: Path) -> TrackMetadata:
     """Build metadata from Spotify CSV columns."""
+    track_number = row.get("Track Number") or row.get("Track #") or row.get("Disc Number")
     return build_track_metadata(
         row["Track Name"],
         row["Artist Name(s)"],
         row.get("Album Name", ""),
         output_dir,
+        year=release_year(row.get("Release Date") or row.get("Year")),
+        track_number=numeric_value(track_number),
+        artwork_url=(
+            row.get("Album Image URL")
+            or row.get("Artwork URL")
+            or row.get("Image URL")
+            or row.get("Cover URL")
+        ),
     )
 
 
@@ -218,6 +236,32 @@ def artist_names(artists: list[dict]) -> str:
     return ";".join(artist["name"] for artist in artists if artist.get("name"))
 
 
+def release_year(release_date: str | None) -> str | None:
+    if not release_date:
+        return None
+    match = re.match(r"\d{4}", release_date)
+    return match.group(0) if match else None
+
+
+def numeric_value(value: object) -> int | None:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
+    return None
+
+
+def largest_image_url(images: list[dict] | None) -> str | None:
+    if not images:
+        return None
+
+    def image_area(image: dict) -> int:
+        return int(image.get("width") or 0) * int(image.get("height") or 0)
+
+    image = max(images, key=image_area)
+    return image.get("url")
+
+
 def metadata_from_spotify_track(track: dict, output_dir: Path) -> TrackMetadata | None:
     if not track or track.get("type") != "track" or track.get("is_local"):
         return None
@@ -228,6 +272,9 @@ def metadata_from_spotify_track(track: dict, output_dir: Path) -> TrackMetadata 
         artist_names(track.get("artists") or []),
         album.get("name", ""),
         output_dir,
+        year=release_year(album.get("release_date")),
+        track_number=numeric_value(track.get("track_number")),
+        artwork_url=largest_image_url(album.get("images")),
     )
 
 
@@ -256,6 +303,18 @@ def youtube_music_entry_url(entry: dict) -> str | None:
     return None
 
 
+def youtube_music_thumbnail_url(entry: dict) -> str | None:
+    thumbnails = entry.get("thumbnails")
+    if isinstance(thumbnails, list):
+        return largest_image_url([item for item in thumbnails if isinstance(item, dict)])
+
+    thumbnail = entry.get("thumbnail")
+    if isinstance(thumbnail, str):
+        return thumbnail
+
+    return None
+
+
 def metadata_from_youtube_music_entry(
     entry: dict,
     output_dir: Path,
@@ -275,7 +334,18 @@ def metadata_from_youtube_music_entry(
 
     album = entry.get("album") or fallback_album or entry.get("playlist_title") or "YouTube Music"
     source_url = youtube_music_entry_url(entry)
-    return build_track_metadata(title, artist, album, output_dir, source_url=source_url)
+    return build_track_metadata(
+        title,
+        artist,
+        album,
+        output_dir,
+        source_url=source_url,
+        year=release_year(
+            str(entry.get("release_year") or entry.get("release_date") or entry.get("upload_date") or "")
+        ),
+        track_number=numeric_value(entry.get("track_number")),
+        artwork_url=youtube_music_thumbnail_url(entry),
+    )
 
 
 def read_youtube_music_url(
@@ -284,6 +354,7 @@ def read_youtube_music_url(
     cookie_args: list[str],
     metadata_limit: int | None,
 ) -> list[TrackMetadata]:
+    print(f"[source] Reading YouTube Music metadata: {source}")
     cmd = [
         "yt-dlp",
         "--dump-single-json",
@@ -309,6 +380,8 @@ def read_youtube_music_url(
     entries = data.get("entries")
     if not entries:
         metadata = metadata_from_youtube_music_entry(data, output_dir, fallback_album)
+        if metadata:
+            print(f"[source] Resolved 1 track from YouTube Music: {metadata.artists} - {metadata.track}")
         return [metadata] if metadata else []
 
     tracks = []
@@ -328,6 +401,7 @@ def read_youtube_music_url(
             )
         raise RuntimeError(f"Could not read YouTube Music metadata for {source}: {message}")
 
+    print(f"[source] Resolved {len(tracks)} track(s) from YouTube Music")
     return tracks
 
 
@@ -347,6 +421,8 @@ def read_spotify_url(source: str, output_dir: Path, token: str) -> list[TrackMet
     if source_type == "album":
         album = spotify_request(f"{api_base}/albums/{source_id}", token)
         album_name = album.get("name", "")
+        album_year = release_year(album.get("release_date"))
+        album_artwork_url = largest_image_url(album.get("images"))
         tracks: list[TrackMetadata] = []
         next_url = f"{api_base}/albums/{source_id}/tracks?limit=50"
         while next_url:
@@ -358,6 +434,9 @@ def read_spotify_url(source: str, output_dir: Path, token: str) -> list[TrackMet
                         artist_names(track.get("artists") or []),
                         album_name,
                         output_dir,
+                        year=album_year,
+                        track_number=numeric_value(track.get("track_number")),
+                        artwork_url=album_artwork_url,
                     )
                 )
             next_url = page.get("next")
@@ -397,6 +476,7 @@ def read_source(
     cookie_args: list[str],
 ) -> list[TrackMetadata]:
     if parse_spotify_source(source):
+        print(f"[source] Reading Spotify metadata: {source}")
         if not spotify_token:
             raise RuntimeError(f"Spotify token was not loaded for source: {source}")
         return read_spotify_url(source, output_dir, spotify_token)
@@ -408,6 +488,7 @@ def read_source(
     if not csv_path.exists():
         raise RuntimeError(f"CSV not found: {csv_path}")
 
+    print(f"[source] Reading CSV: {csv_path}")
     return read_tracks(csv_path, output_dir)
 
 
@@ -438,6 +519,110 @@ def build_cookie_args(args: argparse.Namespace) -> list[str]:
         cookie_args.extend(["--cookies", str(args.cookies.expanduser().resolve())])
 
     return cookie_args
+
+
+def synchsafe_size(size: int) -> bytes:
+    return bytes(
+        [
+            (size >> 21) & 0x7F,
+            (size >> 14) & 0x7F,
+            (size >> 7) & 0x7F,
+            size & 0x7F,
+        ]
+    )
+
+
+def read_synchsafe_size(data: bytes) -> int:
+    return (data[0] << 21) | (data[1] << 14) | (data[2] << 7) | data[3]
+
+
+def id3_text_frame(frame_id: str, value: str | int | None) -> bytes:
+    if value is None or str(value).strip() == "":
+        return b""
+
+    payload = b"\x01" + str(value).encode("utf-16")
+    return frame_id.encode("ascii") + len(payload).to_bytes(4, "big") + b"\x00\x00" + payload
+
+
+def id3_url_frame(frame_id: str, value: str | None) -> bytes:
+    if not value or not value.startswith(("http://", "https://")):
+        return b""
+
+    payload = value.encode("ascii", errors="ignore")
+    return frame_id.encode("ascii") + len(payload).to_bytes(4, "big") + b"\x00\x00" + payload
+
+
+def guess_image_mime_type(url: str, content_type: str | None) -> str:
+    content_type = (content_type or "").split(";", 1)[0].strip().lower()
+    if content_type in {"image/jpeg", "image/png"}:
+        return content_type
+
+    path = urlparse(url).path.lower()
+    if path.endswith(".png"):
+        return "image/png"
+    return "image/jpeg"
+
+
+def fetch_artwork(artwork_url: str | None) -> tuple[str, bytes] | None:
+    if not artwork_url:
+        return None
+
+    request = Request(artwork_url, headers={"User-Agent": "MDL/1.0"})
+    try:
+        with urlopen(request, timeout=20) as response:
+            content_type = response.headers.get("Content-Type")
+            image = response.read(10 * 1024 * 1024 + 1)
+    except (HTTPError, URLError, TimeoutError, OSError) as exc:
+        print(f"[metadata] artwork skipped: {exc}")
+        return None
+
+    if len(image) > 10 * 1024 * 1024:
+        print("[metadata] artwork skipped: image is larger than 10 MB")
+        return None
+
+    return guess_image_mime_type(artwork_url, content_type), image
+
+
+def id3_apic_frame(artwork: tuple[str, bytes] | None) -> bytes:
+    if not artwork:
+        return b""
+
+    mime_type, image = artwork
+    payload = b"\x00" + mime_type.encode("ascii") + b"\x00\x03\x00" + image
+    return b"APIC" + len(payload).to_bytes(4, "big") + b"\x00\x00" + payload
+
+
+def strip_existing_id3v2(data: bytes) -> bytes:
+    if len(data) < 10 or data[:3] != b"ID3":
+        return data
+
+    flags = data[5]
+    tag_size = 10 + read_synchsafe_size(data[6:10])
+    if flags & 0x10:
+        tag_size += 10
+    return data[tag_size:]
+
+
+def write_mp3_metadata(path: Path, track: TrackMetadata) -> None:
+    frames = b"".join(
+        [
+            id3_text_frame("TIT2", track.track),
+            id3_text_frame("TPE1", track.artists.replace(";", "/")),
+            id3_text_frame("TPE2", track.artists.split(";", 1)[0].strip()),
+            id3_text_frame("TALB", track.album),
+            id3_text_frame("TYER", track.year),
+            id3_text_frame("TRCK", track.track_number),
+            id3_url_frame("WOAS", track.source_url),
+            id3_apic_frame(fetch_artwork(track.artwork_url)),
+        ]
+    )
+    if not frames:
+        return
+
+    tag = b"ID3\x03\x00\x00" + synchsafe_size(len(frames)) + frames
+    data = strip_existing_id3v2(path.read_bytes())
+    path.write_bytes(tag + data)
+    print("[metadata] tagged mp3")
 
 
 def download_track(
@@ -485,6 +670,7 @@ def download_track(
         if not mp3s:
             raise RuntimeError(f"yt-dlp did not produce an mp3 for: {track.artists} - {track.track}")
 
+        write_mp3_metadata(mp3s[0], track)
         shutil.move(str(mp3s[0]), track.destination)
         print(f"[saved] {track.destination}")
         return TrackResult("downloaded", track.artists, track.track, track.destination)
