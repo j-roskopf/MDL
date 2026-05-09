@@ -1,0 +1,26 @@
+services:
+  mdl:
+    build: .
+    container_name: mdl-listenbrainz
+    restart: unless-stopped
+    environment:
+      RUN_MODE: weekly
+      RUN_ON_START: "false"
+      TZ: America/Chicago
+      SCHEDULE_DAY: monday
+      SCHEDULE_TIME: "08:00"
+      LISTENBRAINZ_SOURCE: listenbrainz:joebrothehobo
+      OUTPUT_DIR: /music
+      PLEX_URL: http://192.168.86.43:32400
+      PLEX_TOKEN: put-your-token-here
+      PLEX_SECTION_ID: "2"
+      PLEX_PATH_MAP: /music=/data/Music
+      PLEX_REPLACE_PLAYLISTS: "true"
+      PLEX_SCAN_WAIT: "120"
+      PLEX_MATCH_RETRIES: "5"
+      PLEX_MATCH_WAIT: "60"
+      YOUTUBE_SEARCH_RESULTS: "10"
+      YOUTUBE_MIN_SCORE: "50"
+    volumes:
+      - /mnt/POOL/storage-share/Music:/music
+      - /mnt/POOL/storage-share/mdl-logs:/logs

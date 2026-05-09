@@ -1,0 +1,10 @@
+.git/
+__pycache__/
+Music/
+logs/
+csv/
+*.csv
+cookies.txt
+*.cookies.txt
+.env
+.DS_Store
