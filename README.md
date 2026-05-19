@@ -27,6 +27,14 @@ yt-dlp --version
 
 The script uses Python standard library only. No Python package install is needed.
 
+The optional audio-library cleanup utility uses `mutagen` for reading and writing audio tags. Install it in a project-local virtual environment:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install -r requirements.txt
+```
+
 ## Basic Usage
 
 Pass one or more sources:
@@ -218,6 +226,50 @@ Mixed sources are fine:
 
 If the output directory is inside a Plex music library, the script can ask Plex to refresh that library and create audio playlists matching ListenBrainz playlist titles.
 
+To skip downloads and only create Plex playlists from tracks already in your library, use `--skip-downloads`. For `listenbrainz:USERNAME`, this uses the current weekly `weekly-exploration` playlist only:
+
+```bash
+./downloader.py listenbrainz:joebrothehobo \
+  --skip-downloads \
+  --output-dir /path/to/plex/Music \
+  --plex-section-id 2 \
+  --plex-path-map /path/to/plex/Music=/music \
+  --plex-replace-playlists
+```
+
+Tracks that are not on disk are still included in the Plex playlist when Plex can match them by artist and title.
+
+## Audio Library Cleanup
+
+Preview cleanup actions across an existing music library:
+
+```bash
+source .venv/bin/activate
+./audio_library_cleanup.py /path/to/Music
+```
+
+For very large libraries, progress is printed every 250 audio files by default. You can make it chattier:
+
+```bash
+./audio_library_cleanup.py /path/to/Music --progress-every 25
+```
+
+If the library has lots of folders before it finds audio files, folder-walk progress is printed every 100 folders by default. You can make that chattier too:
+
+```bash
+./audio_library_cleanup.py /path/to/Music --directory-progress-every 10
+```
+
+At the end, the script prints a summary with total folders visited, total audio files scanned, total repair matches, and total changes planned or applied.
+
+Apply the cleanup:
+
+```bash
+./audio_library_cleanup.py /path/to/Music --apply
+```
+
+The cleanup utility recursively scans common audio formats. When a file's album tag contains `Indie/Rock Playlist`, or contains `SXSW` plus `showcasting artists` / `showcasing artists`, it looks up the real album from the file's artist and title tags, updates the album tag, creates a sibling album folder next to the current playlist folder, and moves the file there. Lookup is conservative: it requires a valid artist tag, uses Spotify first when `SPOTIFY_CLIENT_ID` and `SPOTIFY_CLIENT_SECRET` are available, then tries strict iTunes matches and filtered MusicBrainz matches. After moving a song, it recursively deletes the old folder the song came from, then keeps walking upward through empty parent folders without deleting the library root. It also changes `albumartist` from `Various Artists` to the file's valid `artist` tag when available.
+
 Set your Plex server URL and token:
 
 ```bash
@@ -254,13 +306,37 @@ If Plex is slow to index new NAS files, increase the scan/match waits:
   --output-dir /Volumes/storage-share/Music \
   --plex-section-id 2 \
   --plex-path-map /Volumes/storage-share/Music=/data/Music \
-  --plex-scan-wait 120 \
-  --plex-match-retries 5 \
+  --plex-scan-wait 60 \
+  --plex-match-timeout 900 \
   --plex-match-wait 60 \
   --plex-replace-playlists
 ```
 
-Those retry settings are useful when downloads finish quickly but Plex has not indexed every new track yet.
+When `--plex-path-map` is set, MDL scans only the album folders for downloaded tracks instead of refreshing the entire music library. That is much faster on large libraries. The match timeout keeps polling Plex until every downloaded file appears in the library or the timeout is reached.
+
+If a weekly run creates a playlist with missing tracks, check the log for `[plex] Could not match in Plex`. That usually means Plex had not finished indexing the new files yet, or `PLEX_PATH_MAP` does not match the path Plex uses for the same files.
+
+To debug path mapping without downloading, run:
+
+```bash
+./downloader.py listenbrainz:joebrothehobo \
+  --output-dir /music \
+  --plex-section-id 2 \
+  --plex-path-map /music=/data/Music \
+  --plex-verify-paths \
+  --plex-verify-limit 10
+```
+
+On TrueNAS:
+
+```bash
+docker compose run --rm \
+  -e RUN_MODE=once \
+  -e EXTRA_ARGS="--plex-verify-paths --plex-verify-limit 10" \
+  mdl
+```
+
+The command prints each track's local path, the expected Plex path, whether Plex's file index contains it, other indexed files in the same album folder, and Plex search results when the exact path does not match. Exit code `1` means at least one on-disk file was missing from Plex's index.
 
 When Plex matches a downloaded track, the script also updates and locks the Plex track title to the downloaded metadata title. This avoids cases where Plex guesses the wrong album track, such as showing `Royals.mp3` as `Tennis Court` because of stale or inferred album metadata.
 
@@ -408,6 +484,12 @@ To run immediately when the container starts and then continue weekly:
 RUN_ON_START: "true"
 ```
 
+To refresh Plex playlists without downloading new tracks:
+
+```yaml
+SKIP_DOWNLOADS: "true"
+```
+
 ## Spotify URL Credentials
 
 CSV mode does not need Spotify credentials.
@@ -510,6 +592,7 @@ Every run prints counts and details for:
 ```text
 Downloaded
 Skipped
+Playlist
 Dry runs
 Failed
 ```
@@ -530,3 +613,10 @@ cookies.txt
 __pycache__/
 .DS_Store
 ```
+
+./downloader.py listenbrainz:joebrothehobo \
+  --skip-downloads \
+  --output-dir /Volumes/storage-share/Music \
+  --plex-section-id 2 \
+  --plex-path-map /Volumes/storage-share/Music=/data/Music \
+  --plex-replace-playlists

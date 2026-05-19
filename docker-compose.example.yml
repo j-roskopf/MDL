@@ -16,11 +16,13 @@ services:
       PLEX_SECTION_ID: "2"
       PLEX_PATH_MAP: /music=/data/Music
       PLEX_REPLACE_PLAYLISTS: "true"
-      PLEX_SCAN_WAIT: "120"
-      PLEX_MATCH_RETRIES: "5"
+      PLEX_SCAN_WAIT: "60"
+      PLEX_MATCH_TIMEOUT: "900"
       PLEX_MATCH_WAIT: "60"
+      # PLEX_MATCH_RETRIES is deprecated; use PLEX_MATCH_TIMEOUT instead.
       YOUTUBE_SEARCH_RESULTS: "10"
       YOUTUBE_MIN_SCORE: "50"
+      # SKIP_DOWNLOADS: "true"
     volumes:
       - /mnt/POOL/storage-share/Music:/music
       - /mnt/POOL/storage-share/mdl-logs:/logs

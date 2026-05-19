@@ -507,6 +507,21 @@ def list_listenbrainz_playlists(username: str, mode: str) -> list[ListenBrainzPl
     return playlists
 
 
+def select_current_weekly_listenbrainz_playlists(
+    playlists: list[ListenBrainzPlaylist],
+) -> list[ListenBrainzPlaylist]:
+    weekly = [playlist for playlist in playlists if playlist.source_patch == "weekly-exploration"]
+    if not weekly:
+        return []
+
+    dated = [playlist for playlist in weekly if playlist.date]
+    if dated:
+        current = max(dated, key=lambda playlist: playlist.date or "")
+        return [current]
+
+    return [weekly[0]]
+
+
 def read_listenbrainz_source(source: str, output_dir: Path) -> list[TrackMetadata]:
     parsed = parse_listenbrainz_source(source)
     if not parsed:
@@ -520,7 +535,9 @@ def read_listenbrainz_source(source: str, output_dir: Path) -> list[TrackMetadat
     print(f"[source] Reading ListenBrainz {mode} playlists for: {value}")
     playlists = list_listenbrainz_playlists(value, mode)
     if mode == "createdfor":
-        playlists = [playlist for playlist in playlists if playlist.source_patch == "weekly-exploration"]
+        playlists = select_current_weekly_listenbrainz_playlists(playlists)
+        if playlists:
+            print(f"[source] Using current weekly playlist: {playlists[0].plex_title}")
     if not playlists:
         print(f"[source] No ListenBrainz {mode} playlists found for {value}")
         return []
@@ -1218,15 +1235,29 @@ def download_track(
         return TrackResult("downloaded", track.artists, track.track, track.destination, playlist_title=track.playlist_title)
 
 
+def resolve_track_without_download(track: TrackMetadata) -> TrackResult:
+    if track.destination.exists():
+        print(f"[skip] {track.destination}")
+        return TrackResult("skipped", track.artists, track.track, track.destination, playlist_title=track.playlist_title)
+
+    print(f"[playlist] {track.artists} - {track.track}")
+    return TrackResult("playlist", track.artists, track.track, track.destination, playlist_title=track.playlist_title)
+
+
+PLEX_SYNC_STATUSES = frozenset({"downloaded", "skipped", "playlist"})
+
+
 def print_summary(results: list[TrackResult]) -> None:
     downloaded = [result for result in results if result.status == "downloaded"]
     skipped = [result for result in results if result.status == "skipped"]
+    playlist_only = [result for result in results if result.status == "playlist"]
     dry_runs = [result for result in results if result.status == "dry-run"]
     failed = [result for result in results if result.status == "failed"]
 
     print("\nSummary")
     print(f"  Downloaded: {len(downloaded)}")
     print(f"  Skipped:    {len(skipped)}")
+    print(f"  Playlist:   {len(playlist_only)}")
     print(f"  Dry runs:   {len(dry_runs)}")
     print(f"  Failed:     {len(failed)}")
 
@@ -1246,6 +1277,7 @@ def print_summary(results: list[TrackResult]) -> None:
 
     print_result_group("Downloaded", downloaded)
     print_result_group("Skipped", skipped)
+    print_result_group("Playlist Only", playlist_only)
     print_result_group("Dry Run", dry_runs)
     print_result_group("Failed", failed, include_error=True)
 
@@ -1284,7 +1316,7 @@ def plex_request_xml(
 
 
 def plex_path_for_local_path(path: Path, path_maps: list[str]) -> str:
-    value = str(path)
+    value = str(path.expanduser().resolve())
     for item in path_maps:
         if "=" not in item:
             raise RuntimeError(f"Invalid Plex path map '{item}'. Use LOCAL=PLEX.")
@@ -1296,6 +1328,28 @@ def plex_path_for_local_path(path: Path, path_maps: list[str]) -> str:
             suffix = value[len(local_prefix.rstrip("/")) :].lstrip("/")
             return f"{plex_prefix.rstrip('/')}/{suffix}"
     return value
+
+
+PLEX_PATH_CHAR_REPLACEMENTS = (
+    ("\ufeff", ""),
+    ("\u00a0", " "),
+    ("\u2010", "-"),
+    ("\u2011", "-"),
+    ("\u2012", "-"),
+    ("\u2013", "-"),
+    ("\u2014", "-"),
+    ("\u2212", "-"),
+    ("\u2018", "'"),
+    ("\u2019", "'"),
+    ("\u201a", "'"),
+    ("\u201b", "'"),
+    ("\u2032", "'"),
+    ("\u2035", "'"),
+    ("\u201c", '"'),
+    ("\u201d", '"'),
+    ("\u201e", '"'),
+    ("\u2033", '"'),
+)
 
 
 def plex_track_elements(root: ET.Element) -> list[ET.Element]:
@@ -1312,9 +1366,55 @@ def plex_track_file(track: ET.Element) -> str | None:
 
 def plex_normalized_path(path: str) -> str:
     path = unicodedata.normalize("NFC", path)
+    for old, new in PLEX_PATH_CHAR_REPLACEMENTS:
+        path = path.replace(old, new)
     path = path.replace("\\", "/")
     path = SPACE_RUN.sub(" ", path)
     return path.rstrip("/").casefold()
+
+
+def dedupe_track_results_for_plex(results: list[TrackResult]) -> list[TrackResult]:
+    seen: set[tuple[str | None, str]] = set()
+    deduped: list[TrackResult] = []
+
+    for result in results:
+        if not result.destination or not result.playlist_title:
+            continue
+        path_key = plex_normalized_path(str(result.destination.resolve()))
+        item_key = (result.playlist_title, path_key)
+        if item_key in seen:
+            continue
+        seen.add(item_key)
+        deduped.append(result)
+
+    removed = len(results) - len(deduped)
+    if removed:
+        print(f"[plex] Ignoring {removed} duplicate playlist track(s) for Plex matching")
+
+    return deduped
+
+
+def plex_refresh_track_locations(
+    plex_url: str,
+    plex_token: str,
+    section_id: str,
+    results: list[TrackResult],
+    path_maps: list[str],
+) -> None:
+    album_dirs: set[str] = set()
+    for result in results:
+        if not result.destination:
+            continue
+        album_dirs.add(plex_path_for_local_path(result.destination.parent, path_maps))
+
+    for album_dir in sorted(album_dirs):
+        params = urlencode({"path": album_dir})
+        print(f"[plex] Scanning album folder: {album_dir}")
+        plex_request_xml(
+            plex_url,
+            plex_token,
+            f"/library/sections/{quote(str(section_id))}/refresh?{params}",
+        )
 
 
 def plex_library_file_map(
@@ -1386,6 +1486,175 @@ def plex_find_track_rating_key(
     return None
 
 
+def plex_local_path_map_prefix(path: Path, path_maps: list[str]) -> str | None:
+    value = str(path.expanduser().resolve())
+    for item in path_maps:
+        if "=" not in item:
+            continue
+        local_prefix, _plex_prefix = item.split("=", 1)
+        local_prefix = str(Path(local_prefix).expanduser().resolve())
+        if value == local_prefix or value.startswith(local_prefix.rstrip("/") + "/"):
+            return local_prefix
+    return None
+
+
+def select_tracks_for_plex_verify(tracks: list[TrackMetadata], limit: int) -> list[TrackMetadata]:
+    on_disk = [track for track in tracks if track.destination.exists()]
+    missing = [track for track in tracks if not track.destination.exists()]
+    selected = on_disk[:limit]
+    remaining = limit - len(selected)
+    if remaining > 0:
+        selected.extend(missing[:remaining])
+    return selected
+
+
+def plex_album_folder_paths(file_map: dict[str, str], expected_key: str, limit: int = 5) -> list[str]:
+    if "/" not in expected_key:
+        return []
+    album_prefix = expected_key.rsplit("/", 1)[0] + "/"
+    return sorted(path for path in file_map if path.startswith(album_prefix))[:limit]
+
+
+def plex_search_path_diagnosis(
+    plex_url: str,
+    plex_token: str,
+    track: TrackMetadata,
+    expected_key: str,
+) -> tuple[str | None, list[str]]:
+    search_params = urlencode({"query": track.track, "type": 10})
+    root = plex_request_xml(plex_url, plex_token, f"/search?{search_params}")
+    candidates = plex_track_elements(root)
+
+    normalized_track = track.track.casefold()
+    normalized_artist = primary_artist_name(track.artists).casefold()
+    candidate_paths: list[str] = []
+
+    for candidate in candidates:
+        candidate_file = plex_track_file(candidate)
+        if not candidate_file:
+            continue
+        candidate_paths.append(candidate_file)
+        if plex_normalized_path(candidate_file) == expected_key:
+            return "search: exact file path", candidate_paths
+
+    for candidate in candidates:
+        candidate_file = plex_track_file(candidate)
+        if not candidate_file:
+            continue
+        title = (candidate.get("title") or "").casefold()
+        artist = (candidate.get("grandparentTitle") or "").casefold()
+        if title == normalized_track and artist == normalized_artist:
+            return "search: artist/title only (file path differs)", candidate_paths
+
+    return None, candidate_paths
+
+
+def run_plex_verify_paths(tracks: list[TrackMetadata], args: argparse.Namespace) -> int:
+    plex_url, plex_token = load_plex_credentials(args)
+    if not plex_url or not plex_token:
+        print("Plex verify needs --plex-url and --plex-token, or PLEX_URL and PLEX_TOKEN.", file=sys.stderr)
+        return 1
+    if not args.plex_section_id:
+        print("Plex verify needs --plex-section-id, or PLEX_SECTION_ID.", file=sys.stderr)
+        return 1
+
+    sample = select_tracks_for_plex_verify(tracks, args.plex_verify_limit)
+    if not sample:
+        print("[plex-verify] No tracks to check")
+        return 0
+
+    print("[plex-verify] Plex path diagnostic")
+    print(f"[plex-verify] Server: {plex_url}")
+    print(f"[plex-verify] Section: {args.plex_section_id}")
+    if args.plex_path_map:
+        for item in args.plex_path_map:
+            print(f"[plex-verify] Path map: {item}")
+    else:
+        print("[plex-verify] Warning: no --plex-path-map set; expected paths use local output paths only.")
+
+    try:
+        print(f"[plex-verify] Loading Plex file index for section {args.plex_section_id}...")
+        file_rating_keys = plex_library_file_map(plex_url, plex_token, args.plex_section_id)
+        print(f"[plex-verify] Loaded {len(file_rating_keys)} indexed file path(s)")
+        print(f"[plex-verify] Checking {len(sample)} track(s) (limit {args.plex_verify_limit})\n")
+
+        exact_matches = 0
+        missing_in_plex = 0
+
+        for index, track in enumerate(sample, start=1):
+            local_path = track.destination.resolve()
+            local_exists = local_path.exists()
+            map_prefix = plex_local_path_map_prefix(local_path, args.plex_path_map)
+            expected_plex_path = plex_path_for_local_path(local_path, args.plex_path_map)
+            expected_key = plex_normalized_path(expected_plex_path)
+            rating_key = file_rating_keys.get(expected_key)
+            exact_match = rating_key is not None
+
+            print(f"--- [{index}/{len(sample)}] {track.artists} - {track.track} ---")
+            print(f"  local:    {local_path}")
+            print(f"  on disk:  {'yes' if local_exists else 'no'}")
+            if args.plex_path_map:
+                if map_prefix:
+                    print(f"  map:      {map_prefix} -> applied")
+                else:
+                    print("  map:      WARNING: local path is outside every --plex-path-map prefix")
+            print(f"  expected: {expected_plex_path}")
+            print(f"  norm key: {expected_key}")
+
+            if exact_match:
+                exact_matches += 1
+                print(f"  plex:     exact file match (ratingKey {rating_key})")
+            else:
+                if local_exists:
+                    missing_in_plex += 1
+                print("  plex:     not found by exact file path in library index")
+
+                album_paths = plex_album_folder_paths(file_rating_keys, expected_key)
+                if album_paths:
+                    print("  plex album folder (indexed paths with same album directory):")
+                    for path in album_paths:
+                        marker = " <-- expected" if path == expected_key else ""
+                        print(f"    - {path}{marker}")
+                elif local_exists:
+                    print("  plex album folder: no indexed files under this album path yet")
+
+                search_match, search_paths = plex_search_path_diagnosis(
+                    plex_url,
+                    plex_token,
+                    track,
+                    expected_key,
+                )
+                if search_match:
+                    print(f"  plex search: {search_match}")
+                if search_paths:
+                    print("  plex search candidates (file paths):")
+                    for path in search_paths[:5]:
+                        print(f"    - {path}")
+                elif not exact_match:
+                    print("  plex search: no track candidates returned")
+
+            print()
+
+        print("[plex-verify] Summary")
+        print(f"  Sampled:        {len(sample)}")
+        print(f"  On disk:        {sum(1 for track in sample if track.destination.exists())}")
+        print(f"  Exact matches:  {exact_matches}")
+        print(f"  Missing index:  {missing_in_plex} on-disk file(s) not in Plex index")
+
+        if missing_in_plex:
+            print(
+                "\n[plex-verify] Some on-disk files are not in Plex's index yet, or PLEX_PATH_MAP does not "
+                "match the path Plex stores. Compare 'expected' with 'plex search candidates' and fix the map."
+            )
+            return 1
+
+        print("\n[plex-verify] All sampled on-disk tracks match Plex file paths.")
+        return 0
+    except (RuntimeError, ET.ParseError) as exc:
+        print(f"[plex-verify] {exc}", file=sys.stderr)
+        return 1
+
+
 def plex_existing_audio_playlist(
     plex_url: str,
     plex_token: str,
@@ -1432,6 +1701,65 @@ def plex_lock_track_title(
     plex_request_xml(plex_url, plex_token, f"/library/sections/{quote(str(section_id))}/all?{params}", method="PUT")
 
 
+def match_plex_playlist_tracks(
+    plex_url: str,
+    plex_token: str,
+    playlist_results: list[TrackResult],
+    args: argparse.Namespace,
+    file_rating_keys: dict[str, str],
+) -> tuple[list[str], list[TrackResult]]:
+    deadline = time.monotonic() + args.plex_match_timeout
+    unmatched = list(playlist_results)
+    rating_keys: list[str] = []
+    seen_rating_keys: set[str] = set()
+    attempt = 0
+
+    while unmatched:
+        attempt += 1
+        next_unmatched: list[TrackResult] = []
+        for result in unmatched:
+            rating_key = plex_find_track_rating_key(
+                plex_url,
+                plex_token,
+                result,
+                args.plex_path_map,
+                file_rating_keys,
+            )
+            if rating_key:
+                if rating_key not in seen_rating_keys:
+                    rating_keys.append(rating_key)
+                    seen_rating_keys.add(rating_key)
+                if args.plex_section_id and not args.no_plex_lock_track_titles:
+                    plex_lock_track_title(
+                        plex_url,
+                        plex_token,
+                        args.plex_section_id,
+                        rating_key,
+                        result.track,
+                    )
+            else:
+                next_unmatched.append(result)
+
+        unmatched = next_unmatched
+        if not unmatched:
+            break
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+
+        print(
+            f"[plex] Waiting for Plex to index {len(unmatched)} unmatched track(s) "
+            f"(attempt {attempt}, up to {int(remaining)}s remaining)"
+        )
+        time.sleep(min(args.plex_match_wait, remaining))
+        if args.plex_section_id:
+            file_rating_keys.clear()
+            file_rating_keys.update(plex_library_file_map(plex_url, plex_token, args.plex_section_id))
+
+    return rating_keys, unmatched
+
+
 def sync_plex_playlists(results: list[TrackResult], args: argparse.Namespace) -> bool:
     plex_url, plex_token = load_plex_credentials(args)
     if not plex_url and not plex_token:
@@ -1443,14 +1771,18 @@ def sync_plex_playlists(results: list[TrackResult], args: argparse.Namespace) ->
         print("[plex] Skipping Plex sync during dry run")
         return True
 
-    usable = [
-        result
-        for result in results
-        if result.status in {"downloaded", "skipped"} and result.destination and result.playlist_title
-    ]
+    usable = dedupe_track_results_for_plex(
+        [
+            result
+            for result in results
+            if result.status in PLEX_SYNC_STATUSES and result.destination and result.playlist_title
+        ]
+    )
     if not usable:
-        print("[plex] No playlist-backed downloaded/skipped tracks to sync")
+        print("[plex] No playlist-backed tracks to sync")
         return True
+
+    sync_ok = True
 
     try:
         root = plex_request_xml(plex_url, plex_token, "/")
@@ -1459,12 +1791,21 @@ def sync_plex_playlists(results: list[TrackResult], args: argparse.Namespace) ->
             raise RuntimeError("Could not read Plex machineIdentifier from server root.")
 
         if args.plex_section_id:
-            print(f"[plex] Refreshing library section {args.plex_section_id}")
-            plex_request_xml(
-                plex_url,
-                plex_token,
-                f"/library/sections/{quote(str(args.plex_section_id))}/refresh",
-            )
+            if args.plex_path_map:
+                plex_refresh_track_locations(
+                    plex_url,
+                    plex_token,
+                    args.plex_section_id,
+                    usable,
+                    args.plex_path_map,
+                )
+            else:
+                print(f"[plex] Refreshing library section {args.plex_section_id}")
+                plex_request_xml(
+                    plex_url,
+                    plex_token,
+                    f"/library/sections/{quote(str(args.plex_section_id))}/refresh",
+                )
             if args.plex_scan_wait > 0:
                 time.sleep(args.plex_scan_wait)
 
@@ -1479,45 +1820,19 @@ def sync_plex_playlists(results: list[TrackResult], args: argparse.Namespace) ->
             grouped.setdefault(result.playlist_title or "ListenBrainz", []).append(result)
 
         for playlist_title, playlist_results in grouped.items():
-            rating_keys: list[str] = []
-            unmatched = playlist_results
-            for attempt in range(1, args.plex_match_retries + 1):
-                next_unmatched: list[TrackResult] = []
-                for result in unmatched:
-                    rating_key = plex_find_track_rating_key(
-                        plex_url,
-                        plex_token,
-                        result,
-                        args.plex_path_map,
-                        file_rating_keys,
-                    )
-                    if rating_key:
-                        rating_keys.append(rating_key)
-                        if args.plex_section_id and not args.no_plex_lock_track_titles:
-                            plex_lock_track_title(
-                                plex_url,
-                                plex_token,
-                                args.plex_section_id,
-                                rating_key,
-                                result.track,
-                            )
-                    else:
-                        next_unmatched.append(result)
-
-                unmatched = next_unmatched
-                if not unmatched or attempt >= args.plex_match_retries:
-                    break
-
-                print(
-                    f"[plex] Waiting for Plex to index {len(unmatched)} unmatched track(s) "
-                    f"before retry {attempt + 1}/{args.plex_match_retries}"
-                )
-                time.sleep(args.plex_match_wait)
-                if args.plex_section_id:
-                    file_rating_keys = plex_library_file_map(plex_url, plex_token, args.plex_section_id)
+            rating_keys, unmatched = match_plex_playlist_tracks(
+                plex_url,
+                plex_token,
+                playlist_results,
+                args,
+                file_rating_keys,
+            )
 
             for result in unmatched:
                 print(f"[plex] Could not match in Plex: {result.label}")
+
+            if unmatched:
+                sync_ok = False
 
             if not rating_keys:
                 print(f"[plex] No Plex tracks found for playlist: {playlist_title}")
@@ -1533,12 +1848,15 @@ def sync_plex_playlists(results: list[TrackResult], args: argparse.Namespace) ->
                     plex_delete_playlist(plex_url, plex_token, rating_key)
 
             plex_create_audio_playlist(plex_url, plex_token, machine_id, playlist_title, rating_keys)
-            print(f"[plex] Created playlist '{playlist_title}' with {len(rating_keys)} track(s)")
+            print(
+                f"[plex] Created playlist '{playlist_title}' with {len(rating_keys)} track(s) "
+                f"({len(playlist_results) - len(unmatched)}/{len(playlist_results)} matched)"
+            )
     except (RuntimeError, ET.ParseError) as exc:
         print(f"[plex] {exc}", file=sys.stderr)
         return False
 
-    return True
+    return sync_ok
 
 
 def parse_args() -> argparse.Namespace:
@@ -1563,6 +1881,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("-o", "--output-dir", default=Path("Music"), type=Path)
     parser.add_argument("--limit", type=int, help="Download only the first N tracks.")
     parser.add_argument("--dry-run", action="store_true", help="Show searches and output paths without downloading.")
+    parser.add_argument(
+        "--skip-downloads",
+        action="store_true",
+        help=(
+            "Do not download tracks. Resolve ListenBrainz playlists and create Plex audio playlists "
+            "from tracks already in the library."
+        ),
+    )
     parser.add_argument(
         "--youtube-search-results",
         type=int,
@@ -1608,8 +1934,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--plex-match-retries",
         type=int,
-        default=3,
-        help="Number of Plex matching attempts after refresh. Default: 3.",
+        default=None,
+        help=(
+            "Deprecated. Prefer --plex-match-timeout. "
+            "If set, waits at least this many attempts times --plex-match-wait."
+        ),
+    )
+    parser.add_argument(
+        "--plex-match-timeout",
+        type=int,
+        default=600,
+        help=(
+            "Maximum seconds to wait for Plex to index downloaded tracks before creating playlists. "
+            "Default: 600."
+        ),
     )
     parser.add_argument(
         "--plex-match-wait",
@@ -1634,15 +1972,40 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Do not edit/lock Plex track titles to the downloaded metadata title.",
     )
+    parser.add_argument(
+        "--plex-verify-paths",
+        action="store_true",
+        help=(
+            "Compare expected Plex file paths for playlist tracks against the Plex library index "
+            "and exit without downloading."
+        ),
+    )
+    parser.add_argument(
+        "--plex-verify-limit",
+        type=int,
+        default=10,
+        help="Number of tracks to sample with --plex-verify-paths. Prefers files already on disk. Default: 10.",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     load_env_file(Path(".env"))
     args = parse_args()
+    if args.plex_match_retries is not None:
+        legacy_timeout = args.plex_match_retries * args.plex_match_wait
+        args.plex_match_timeout = max(args.plex_match_timeout, legacy_timeout)
     output_dir = args.output_dir.expanduser().resolve()
 
-    if shutil.which("yt-dlp") is None and not args.dry_run:
+    if args.skip_downloads and args.dry_run:
+        print("Use either --skip-downloads or --dry-run, not both.", file=sys.stderr)
+        return 1
+
+    if args.plex_verify_paths and args.skip_downloads:
+        print("Use either --plex-verify-paths or --skip-downloads, not both.", file=sys.stderr)
+        return 1
+
+    if shutil.which("yt-dlp") is None and not args.dry_run and not args.skip_downloads and not args.plex_verify_paths:
         print("yt-dlp is not installed or is not on PATH.", file=sys.stderr)
         return 1
 
@@ -1661,20 +2024,26 @@ def main() -> int:
     if args.limit is not None:
         tracks = tracks[: args.limit]
 
+    if args.plex_verify_paths:
+        return run_plex_verify_paths(tracks, args)
+
     results: list[TrackResult] = []
     for index, track in enumerate(tracks, start=1):
         try:
             print(f"\n[{index}/{len(tracks)}]")
-            results.append(
-                download_track(
-                    track,
-                    output_dir,
-                    args.dry_run,
-                    cookie_args,
-                    args.youtube_search_results,
-                    args.youtube_min_score,
+            if args.skip_downloads:
+                results.append(resolve_track_without_download(track))
+            else:
+                results.append(
+                    download_track(
+                        track,
+                        output_dir,
+                        args.dry_run,
+                        cookie_args,
+                        args.youtube_search_results,
+                        args.youtube_min_score,
+                    )
                 )
-            )
         except (RuntimeError, subprocess.CalledProcessError) as exc:
             error = str(exc)
             results.append(

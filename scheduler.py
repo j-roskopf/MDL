@@ -70,6 +70,10 @@ def build_downloader_command() -> list[str]:
     if plex_match_retries:
         command.extend(["--plex-match-retries", plex_match_retries])
 
+    plex_match_timeout = os.environ.get("PLEX_MATCH_TIMEOUT")
+    if plex_match_timeout:
+        command.extend(["--plex-match-timeout", plex_match_timeout])
+
     plex_match_wait = os.environ.get("PLEX_MATCH_WAIT")
     if plex_match_wait:
         command.extend(["--plex-match-wait", plex_match_wait])
@@ -88,6 +92,9 @@ def build_downloader_command() -> list[str]:
 
     if env_bool("DRY_RUN"):
         command.append("--dry-run")
+
+    if env_bool("SKIP_DOWNLOADS"):
+        command.append("--skip-downloads")
 
     command.extend(split_env_args(os.environ.get("EXTRA_ARGS")))
     return command
