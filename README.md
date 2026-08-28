@@ -467,6 +467,41 @@ Stop the weekly scheduler:
 docker compose down
 ```
 
+### Re-run the current week
+
+To download this week's ListenBrainz playlist again without waiting for the schedule:
+
+```bash
+docker compose run --rm \
+  -e RUN_MODE=once \
+  -e DRY_RUN=false \
+  mdl
+```
+
+Already-downloaded tracks are skipped. Failures from an earlier run will be retried.
+
+### Keeping yt-dlp current
+
+YouTube regularly breaks downloaders. The Docker image installs Deno (needed for modern YouTube extraction) and an entrypoint that upgrades `yt-dlp` on every container start before the scheduler runs.
+
+After pulling these changes on TrueNAS:
+
+```bash
+cd /mnt/POOL/apps/mdl
+git pull
+docker compose build --no-cache
+docker compose up -d
+```
+
+If you still see `HTTP Error 403: Forbidden`, export a logged-in browser `cookies.txt`, mount it into the container, and pass it via `EXTRA_ARGS`:
+
+```yaml
+environment:
+  EXTRA_ARGS: "--cookies /cookies/cookies.txt --sleep-requests 1 --sleep-interval 3 --max-sleep-interval 8"
+volumes:
+  - /mnt/POOL/apps/mdl/cookies:/cookies:ro
+```
+
 ### Weekly Schedule Settings
 
 The example compose file runs every Monday at `08:00` in `America/Chicago`:
